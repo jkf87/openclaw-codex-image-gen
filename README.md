@@ -1,6 +1,11 @@
 # openclaw-codex-image-gen
 
+Reference book link: <https://www.yes24.com/product/goods/185166276>
+
 OpenClaw plugin for generating images via `codex responses` and the `image_generation` tool under the current Codex login session.
+
+![Example promotional hero image generated with the plugin](./assets/chatgpt-images2-book-hero-rr.png)
+
 
 This plugin is now based on the same practical direction as the reference skill from <https://github.com/Gyu-bot/codex-image-generation-skill>, but adapted to the OpenClaw plugin lifecycle and tool interface.
 
