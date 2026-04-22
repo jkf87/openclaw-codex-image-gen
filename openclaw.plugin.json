@@ -1,0 +1,32 @@
+{
+  "id": "codex-image-gen",
+  "name": "Codex Image Generator",
+  "description": "Generates images via OpenAI Codex CLI $imagegen command. Registers codex_image_generate tool.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "outputDir": {
+        "type": "string",
+        "description": "Default output directory for generated images.",
+        "default": ""
+      },
+      "timeoutSeconds": {
+        "type": "number",
+        "minimum": 10,
+        "maximum": 300,
+        "default": 120
+      },
+      "tempDirMaxAgeHours": {
+        "type": "number",
+        "minimum": 1,
+        "default": 24
+      },
+      "cleanupIntervalMinutes": {
+        "type": "number",
+        "minimum": 5,
+        "default": 60
+      }
+    }
+  }
+}
