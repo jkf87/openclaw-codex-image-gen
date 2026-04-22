@@ -1,6 +1,6 @@
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { execFile } from "child_process";
-import { mkdtemp, readdir, rename, writeFile, rm, stat } from "fs/promises";
+import { mkdtemp, readdir, writeFile, rm, stat } from "fs/promises";
 import { tmpdir } from "os";
 import { join, extname, resolve } from "path";
 
@@ -15,7 +15,9 @@ const AR = ["landscape", "square", "portrait"] as const;
 const BG = ["auto", "transparent", "opaque"] as const;
 const IMG = new Set([".png", ".webp", ".jpg", ".jpeg"]);
 const PFX = "openclaw-codex-imagegen-";
-let codexCache: { ok: boolean; ts: number } | null = null;
+const PREFERRED_CODEX = "/Users/conanssam-m4/.npm-global/bin/codex";
+const CODEX_CONFIG_OVERRIDES = ["-c", "mcp_servers={}"];
+let codexCache: { ok: boolean; ts: number; path: string } | null = null;
 let lastGC = 0;
 
 function getCfg(r: unknown): Required<Cfg> {
@@ -41,21 +43,79 @@ function isImg(f: string) {
   return IMG.has(extname(f).toLowerCase());
 }
 
+function sizeForAspectRatio(aspectRatio: string) {
+  switch (aspectRatio) {
+    case "landscape":
+      return "1536x1024";
+    case "portrait":
+      return "1024x1536";
+    default:
+      return "1024x1024";
+  }
+}
+
+function buildPayload(prompt: string, aspectRatio: string, background: string) {
+  return JSON.stringify({
+    model: "gpt-5.4",
+    instructions: "Use the image_generation tool to create the requested image. Return the image generation result.",
+    input: [
+      {
+        role: "user",
+        content: [{ type: "input_text", text: prompt.trim() }],
+      },
+    ],
+    tools: [
+      {
+        type: "image_generation",
+        size: sizeForAspectRatio(aspectRatio),
+        quality: "high",
+        background,
+        action: "generate",
+      },
+    ],
+    tool_choice: { type: "image_generation" },
+    store: false,
+    stream: true,
+  });
+}
+
+function extractImageBase64(eventsText: string) {
+  let imageBase64: string | null = null;
+  for (const line of eventsText.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try {
+      const event = JSON.parse(line);
+      const item = event?.item || {};
+      if (event?.type === "response.output_item.done" && item?.type === "image_generation_call") {
+        imageBase64 = item?.result || imageBase64;
+      }
+    } catch {}
+  }
+  return imageBase64;
+}
+
 async function ensureCodex() {
   const now = Date.now();
   if (codexCache && now - codexCache.ts < 300000) {
-    if (codexCache.ok) return;
+    if (codexCache.ok) return codexCache.path;
     throw new Error("Codex CLI not available (cached).");
   }
-  const codexPath = await new Promise<string>((r, j) =>
-    execFile("which", ["codex"], (e, o) => (e ? j(new Error("Codex CLI not found. Install: npm i -g @openai/codex")) : r(o.trim()))),
-  );
-  const features = await new Promise<string>((r, j) =>
-    execFile(codexPath, ["features", "list"], { timeout: 15000 }, (e, o, s) => (e ? j(new Error(s || e.message)) : r(o))),
-  );
-  const ok = features.includes("image_generation");
-  codexCache = { ok, ts: now };
-  if (!ok) throw new Error("Codex image_generation not enabled.\n" + features);
+
+  const candidates = [PREFERRED_CODEX, "codex"];
+  let lastErr = "";
+  for (const candidate of candidates) {
+    try {
+      await new Promise<void>((r, j) =>
+        execFile(candidate, ["--version"], { timeout: 15000 }, (e, _o, s) => (e ? j(new Error(s || e.message)) : r())),
+      );
+      codexCache = { ok: true, ts: now, path: candidate };
+      return candidate;
+    } catch (err: any) {
+      lastErr = err?.message || String(err);
+    }
+  }
+
+  throw new Error("Codex CLI not found or unusable. " + lastErr);
 }
 
 async function cleanupTempDirs(maxH: number, intM: number) {
@@ -83,7 +143,7 @@ interface ImageGenParams {
 }
 
 async function generate(params: ImageGenParams, cfg: Required<Cfg>) {
-  await ensureCodex();
+  const codexPath = await ensureCodex();
   const { prompt, aspect_ratio = "square", file_name, background = "auto", timeout_seconds } = params;
   if (!prompt?.trim()) throw new Error("prompt is required.");
   if (!AR.includes(aspect_ratio as any)) throw new Error("Invalid aspect_ratio: " + aspect_ratio);
@@ -92,59 +152,32 @@ async function generate(params: ImageGenParams, cfg: Required<Cfg>) {
   const timeout = (timeout_seconds && timeout_seconds > 0 ? timeout_seconds : cfg.timeoutSeconds) * 1000;
   const outName = safeName(file_name || prompt.slice(0, 60));
   const outDir = params.output_dir || cfg.outputDir || (await mkdtemp(join(tmpdir(), PFX)));
-
-  let existing: Set<string>;
-  try {
-    existing = new Set((await readdir(outDir)).filter(isImg));
-  } catch {
-    existing = new Set();
-  }
-
-  const codexPrompt =
-    "$imagegen\n\nCreative brief: " +
-    prompt.trim() +
-    "\n\nAspect ratio: " +
-    aspect_ratio +
-    "\nBackground: " +
-    background +
-    "\nSave the image as: " +
-    outName;
+  const outputPath = join(outDir, outName);
+  const eventsPath = join(outDir, "codex.responses.jsonl");
+  const stderrLog = join(outDir, "codex.stderr.log");
+  const payload = buildPayload(prompt, aspect_ratio, background);
 
   const { stdout, stderr } = await new Promise<{ stdout: string; stderr: string }>((r, j) => {
-    execFile(
-      "codex",
-      ["exec", "--skip-git-repo-check", "--ephemeral", "--output-last-message", "result.txt", codexPrompt],
-      { cwd: outDir, timeout, maxBuffer: 10 * 1024 * 1024 },
-      (e, o, s) => {
-        if (e && (e as any).killed) return j(new Error("Codex timed out after " + timeout / 1000 + "s"));
-        r({ stdout: o || "", stderr: s || "" });
-      },
-    );
+    execFile(codexPath, [...CODEX_CONFIG_OVERRIDES, "responses"], { cwd: outDir, timeout, maxBuffer: 30 * 1024 * 1024 }, (e, o, s) => {
+      if (e && (e as any).killed) return j(new Error("Codex timed out after " + timeout / 1000 + "s"));
+      if (e) return j(new Error(s || e.message));
+      r({ stdout: o || "", stderr: s || "" });
+    }).stdin?.end(payload);
   });
 
-  const stdoutLog = join(outDir, "codex.stdout.log");
-  const stderrLog = join(outDir, "codex.stderr.log");
-  await Promise.all([writeFile(stdoutLog, stdout).catch(() => {}), writeFile(stderrLog, stderr).catch(() => {})]);
+  await Promise.all([writeFile(eventsPath, stdout).catch(() => {}), writeFile(stderrLog, stderr).catch(() => {})]);
 
-  const expectedPath = join(outDir, outName);
-  let finalPath: string;
-  try {
-    await stat(expectedPath);
-    finalPath = expectedPath;
-  } catch {
-    const newImgs = (await readdir(outDir)).filter((f) => isImg(f) && !existing.has(f));
-    if (!newImgs.length) throw new Error("Codex produced no image. Check logs in: " + outDir);
-    if (newImgs.length > 1) throw new Error("AMBIGUOUS_OUTPUT: " + newImgs.length + " new images found.");
-    await rename(join(outDir, newImgs[0]), expectedPath);
-    finalPath = expectedPath;
-  }
+  const imageBase64 = extractImageBase64(stdout);
+  if (!imageBase64) throw new Error("Codex produced no image_generation_call result. Check logs in: " + outDir);
+  await writeFile(outputPath, Buffer.from(imageBase64, "base64"));
+  await stat(outputPath);
 
-  const absPath = resolve(finalPath);
+  const absPath = resolve(outputPath);
   return {
     image_path: absPath,
     file_name: outName,
     output_dir: outDir,
-    stdout_log: stdoutLog,
+    stdout_log: eventsPath,
     stderr_log: stderrLog,
     assistant_hint: "Image generated at: " + absPath + "\nTelegram: MEDIA:" + absPath,
   };
@@ -153,7 +186,7 @@ async function generate(params: ImageGenParams, cfg: Required<Cfg>) {
 export default definePluginEntry({
   id: "codex-image-gen",
   name: "Codex Image Generator",
-  description: "Generates images via OpenAI Codex CLI $imagegen command.",
+  description: "Generates images via OpenAI Codex CLI responses/image_generation flow.",
   configSchema: {
     type: "object",
     additionalProperties: false,
@@ -168,7 +201,7 @@ export default definePluginEntry({
     // Register codex_image_generate tool
     api.registerTool("codex_image_generate", {
       description:
-        "Generate an image using OpenAI Codex CLI $imagegen. " +
+        "Generate an image using OpenAI Codex CLI responses/image_generation. " +
         "Returns the absolute file path of the generated image. " +
         "Supports aspect ratio (landscape/square/portrait) and background (auto/transparent/opaque).",
       inputSchema: {
