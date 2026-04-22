@@ -116,6 +116,7 @@ The plugin returns:
 - **Codex availability caching** for 5 minutes
 - **Temp directory cleanup** for stale output folders
 - **Saved event logs** for debugging extraction failures
+- **429 round-robin fallback** through the ohmyclaw Codex OAuth pool when multiple accounts are enabled
 
 ## Prerequisites
 
@@ -157,6 +158,8 @@ openclaw gateway restart
 All config is optional and comes from `openclaw.plugin.json`.
 
 Implementation note: `model: "gpt-5.4"` and `quality: "high"` are currently hardcoded in `index.ts` and are not user-configurable yet.
+
+Environment note: if `ohmyclaw`'s Codex OAuth pool is available and enabled, this plugin can rotate across multiple Codex OAuth homes on 429 rate limits.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
@@ -215,6 +218,29 @@ codex login status
 ```
 
 If the session is not valid, re-login.
+
+### 429 rate limit on one Codex account
+
+This plugin can retry through the ohmyclaw Codex OAuth pool instead of failing immediately.
+
+Expected setup:
+
+- `CODEX_OAUTH_ENABLED=true`
+- multiple Codex homes logged in, for example:
+  - `~/.codex`
+  - `~/.codex-acct2`
+  - `~/.codex-acct3`
+- the corresponding Codex pool accounts enabled in:
+  - `~/.openclaw/repos/ohmyclaw/skills/ohmyclaw/routing.json`
+
+Behavior:
+
+1. pick the next Codex OAuth account with `pool.sh next gpt-5.4`
+2. call `codex responses` with that `CODEX_HOME`
+3. if a 429 / `usage_limit_reached` error appears, mark that account in cooldown
+4. retry with the next eligible OAuth account
+
+This makes image generation much more resilient when one ChatGPT/Codex OAuth account is temporarily exhausted.
 
 ### MCP-related failures appear during generation
 
@@ -281,6 +307,28 @@ This repository was tested successfully with:
 - "이미지 생성해줘"
 - "draw an icon"
 - "generate a picture"
+
+### 429가 뜰 때 Codex OAuth 라운드로빈
+
+이 플러그인은 ohmyclaw의 Codex OAuth pool이 켜져 있으면, 한 계정에서 429가 떠도 바로 죽지 않고 다음 계정으로 넘길 수 있습니다.
+
+전제 조건은 다음과 같습니다.
+
+- `CODEX_OAUTH_ENABLED=true`
+- 여러 Codex 홈이 로그인되어 있어야 함
+  - `~/.codex`
+  - `~/.codex-acct2`
+  - `~/.codex-acct3`
+- `~/.openclaw/repos/ohmyclaw/skills/ohmyclaw/routing.json` 에서 codex pool 계정이 `enabled: true` 여야 함
+
+동작 순서는 이렇습니다.
+
+1. `pool.sh next gpt-5.4` 로 다음 계정을 고름
+2. 그 계정의 `CODEX_HOME` 으로 `codex responses` 호출
+3. 429 또는 `usage_limit_reached` 가 뜨면 해당 계정을 cooldown 처리
+4. 다음 계정으로 자동 재시도
+
+즉, Plus/Pro 계정이 여러 개면 이미지 생성 한도를 한 계정에만 묶지 않고 분산할 수 있습니다.
 
 ## License
 

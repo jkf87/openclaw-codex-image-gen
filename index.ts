@@ -1,7 +1,7 @@
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { execFile } from "child_process";
 import { mkdtemp, readdir, writeFile, rm, stat } from "fs/promises";
-import { tmpdir } from "os";
+import { homedir, tmpdir } from "os";
 import { join, extname, resolve } from "path";
 
 type Cfg = {
@@ -16,6 +16,7 @@ const BG = ["auto", "transparent", "opaque"] as const;
 const IMG = new Set([".png", ".webp", ".jpg", ".jpeg"]);
 const PFX = "openclaw-codex-imagegen-";
 const PREFERRED_CODEX = "/Users/conanssam-m4/.npm-global/bin/codex";
+const OHMYCLAW_POOL = "/Users/conanssam-m4/.openclaw/repos/ohmyclaw/skills/ohmyclaw/pool.sh";
 const CODEX_CONFIG_OVERRIDES = ["-c", "mcp_servers={}"];
 let codexCache: { ok: boolean; ts: number; path: string } | null = null;
 let lastGC = 0;
@@ -94,6 +95,68 @@ function extractImageBase64(eventsText: string) {
   return imageBase64;
 }
 
+function expandHome(p: string) {
+  return p.startsWith("~/") ? join(homedir(), p.slice(2)) : p;
+}
+
+function isRateLimitError(message: string) {
+  const text = message.toLowerCase();
+  return text.includes("429") || text.includes("usage_limit_reached") || text.includes("too many requests");
+}
+
+type PoolAccount = {
+  id: string;
+  authType: string;
+  authValue: string;
+  plan: string;
+  weight: string;
+};
+
+async function pickCodexPoolAccount(model: string): Promise<PoolAccount | null> {
+  try {
+    const line = await new Promise<string>((resolvePick, rejectPick) =>
+      execFile(
+        OHMYCLAW_POOL,
+        ["next", model],
+        { env: { ...process.env, CODEX_OAUTH_ENABLED: "true" }, timeout: 15000 },
+        (e, o, s) => (e ? rejectPick(new Error(s || e.message)) : resolvePick((o || "").trim())),
+      ),
+    );
+    if (!line) return null;
+    const [id, authType, authValue, plan, weight] = line.split("|");
+    if (!id || !authType || !authValue) return null;
+    return { id, authType, authValue: expandHome(authValue), plan: plan || "any", weight: weight || "1" };
+  } catch {
+    return null;
+  }
+}
+
+async function markCodexPoolCooldown(id: string) {
+  try {
+    await new Promise<void>((resolveCooldown, rejectCooldown) =>
+      execFile(
+        OHMYCLAW_POOL,
+        ["cooldown", id],
+        { env: { ...process.env, CODEX_OAUTH_ENABLED: "true" }, timeout: 15000 },
+        (e, _o, s) => (e ? rejectCooldown(new Error(s || e.message)) : resolveCooldown()),
+      ),
+    );
+  } catch {}
+}
+
+async function releaseCodexPoolAccount(id: string) {
+  try {
+    await new Promise<void>((resolveRelease, rejectRelease) =>
+      execFile(
+        OHMYCLAW_POOL,
+        ["release", id],
+        { env: { ...process.env, CODEX_OAUTH_ENABLED: "true" }, timeout: 15000 },
+        (e, _o, s) => (e ? rejectRelease(new Error(s || e.message)) : resolveRelease()),
+      ),
+    );
+  } catch {}
+}
+
 async function ensureCodex() {
   const now = Date.now();
   if (codexCache && now - codexCache.ts < 300000) {
@@ -142,6 +205,32 @@ interface ImageGenParams {
   timeout_seconds?: number;
 }
 
+async function runCodexResponses(codexPath: string, payload: string, cwd: string, timeout: number, codexHome?: string) {
+  return await new Promise<{ stdout: string; stderr: string }>((resolveRun, rejectRun) => {
+    const child = execFile(
+      codexPath,
+      [...CODEX_CONFIG_OVERRIDES, "responses"],
+      {
+        cwd,
+        timeout,
+        maxBuffer: 30 * 1024 * 1024,
+        env: codexHome ? { ...process.env, CODEX_HOME: codexHome } : process.env,
+      },
+      (e, o, s) => {
+        if (e && (e as any).killed) return rejectRun(new Error("Codex timed out after " + timeout / 1000 + "s"));
+        if (e) {
+          const err: any = new Error(s || e.message);
+          err.stdout = o || "";
+          err.stderr = s || "";
+          return rejectRun(err);
+        }
+        resolveRun({ stdout: o || "", stderr: s || "" });
+      },
+    );
+    child.stdin?.end(payload);
+  });
+}
+
 async function generate(params: ImageGenParams, cfg: Required<Cfg>) {
   const codexPath = await ensureCodex();
   const { prompt, aspect_ratio = "square", file_name, background = "auto", timeout_seconds } = params;
@@ -157,15 +246,47 @@ async function generate(params: ImageGenParams, cfg: Required<Cfg>) {
   const stderrLog = join(outDir, "codex.stderr.log");
   const payload = buildPayload(prompt, aspect_ratio, background);
 
-  const { stdout, stderr } = await new Promise<{ stdout: string; stderr: string }>((r, j) => {
-    execFile(codexPath, [...CODEX_CONFIG_OVERRIDES, "responses"], { cwd: outDir, timeout, maxBuffer: 30 * 1024 * 1024 }, (e, o, s) => {
-      if (e && (e as any).killed) return j(new Error("Codex timed out after " + timeout / 1000 + "s"));
-      if (e) return j(new Error(s || e.message));
-      r({ stdout: o || "", stderr: s || "" });
-    }).stdin?.end(payload);
-  });
+  let stdout = "";
+  let stderr = "";
+  let lastErr: any = null;
+  let usedAccountId = "";
+  const tried = new Set<string>();
+  const maxAttempts = 4;
+  const stderrParts: string[] = [];
 
-  await Promise.all([writeFile(eventsPath, stdout).catch(() => {}), writeFile(stderrLog, stderr).catch(() => {})]);
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const account = await pickCodexPoolAccount("gpt-5.4");
+    const accountId = account?.id || "direct";
+    const codexHome = account?.authType === "oauth_codex" ? account.authValue : undefined;
+    if (account && tried.has(account.id)) break;
+    if (account) tried.add(account.id);
+
+    try {
+      const result = await runCodexResponses(codexPath, payload, outDir, timeout, codexHome);
+      stdout = result.stdout;
+      stderr = result.stderr;
+      usedAccountId = accountId;
+      if (account) await releaseCodexPoolAccount(account.id);
+      lastErr = null;
+      break;
+    } catch (err: any) {
+      lastErr = err;
+      const errText = err?.stderr || err?.message || String(err);
+      stderrParts.push(`[attempt ${attempt + 1}][${accountId}] ${errText}`);
+      if (account && isRateLimitError(errText)) {
+        await markCodexPoolCooldown(account.id);
+        continue;
+      }
+      if (!account && isRateLimitError(errText)) {
+        continue;
+      }
+      break;
+    }
+  }
+
+  if (lastErr) throw lastErr;
+
+  await Promise.all([writeFile(eventsPath, stdout).catch(() => {}), writeFile(stderrLog, [...stderrParts, stderr, usedAccountId ? `used_account=${usedAccountId}` : ""].filter(Boolean).join("\n\n")).catch(() => {})]);
 
   const imageBase64 = extractImageBase64(stdout);
   if (!imageBase64) throw new Error("Codex produced no image_generation_call result. Check logs in: " + outDir);
