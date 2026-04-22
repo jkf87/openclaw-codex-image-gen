@@ -1,6 +1,6 @@
 {
   "name": "codex-image-gen",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "description": "OpenClaw plugin for Codex CLI image generation via codex responses and image_generation.",
   "main": "index.ts",
