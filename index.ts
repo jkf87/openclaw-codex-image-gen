@@ -6,6 +6,7 @@ import { join, resolve } from "path";
 
 type Cfg = {
   outputDir?: string;
+  codexPath?: string;
   timeoutSeconds?: number;
   tempDirMaxAgeHours?: number;
   cleanupIntervalMinutes?: number;
@@ -24,6 +25,7 @@ function getCfg(r: unknown): Required<Cfg> {
   const c = (r ?? {}) as Cfg;
   return {
     outputDir: c.outputDir || "",
+    codexPath: c.codexPath || process.env.CODEX_PATH || "codex",
     timeoutSeconds: c.timeoutSeconds && c.timeoutSeconds > 0 ? c.timeoutSeconds : 120,
     tempDirMaxAgeHours:
       c.tempDirMaxAgeHours && c.tempDirMaxAgeHours > 0 ? c.tempDirMaxAgeHours : 24,
@@ -117,7 +119,7 @@ async function generate(params: ImageGenParams, cfg: Required<Cfg>) {
     stdout: string;
     stderr: string;
   }>((res, rej) => {
-    const proc = spawn("codex", ["responses"], {
+    const proc = spawn(cfg.codexPath, ["responses"], {
       stdio: ["pipe", "pipe", "pipe"],
     });
     let out = "";
@@ -196,6 +198,7 @@ export default definePluginEntry({
     additionalProperties: false,
     properties: {
       outputDir: { type: "string", default: "" },
+      codexPath: { type: "string", default: "codex", description: "Path to codex CLI binary. Falls back to CODEX_PATH env var, then PATH resolution." },
       timeoutSeconds: { type: "number", minimum: 10, maximum: 300, default: 120 },
       tempDirMaxAgeHours: { type: "number", minimum: 1, default: 24 },
       cleanupIntervalMinutes: { type: "number", minimum: 5, default: 60 },

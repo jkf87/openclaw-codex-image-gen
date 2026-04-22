@@ -1,7 +1,7 @@
 {
   "id": "codex-image-gen",
   "name": "Codex Image Generator",
-  "description": "Generates images via OpenAI Codex CLI $imagegen command. Registers codex_image_generate tool.",
+  "description": "Generates images via Codex CLI Responses API (image_generation tool). Registers codex_image_generate tool.",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
