@@ -6,8 +6,15 @@ OpenClaw plugin for generating images via `codex responses` and the `image_gener
 
 ![Example promotional hero image generated with the plugin](./assets/chatgpt-images2-book-hero-rr.png)
 
+Inspired by [hermes-gpt-image-gen](https://github.com/Jinbro98/hermes-gpt-image-gen) and the reference skill [codex-image-generation-skill](https://github.com/Gyu-bot/codex-image-generation-skill), then adapted for the OpenClaw plugin lifecycle and tool interface.
 
-This plugin is now based on the same practical direction as the reference skill from <https://github.com/Gyu-bot/codex-image-generation-skill>, but adapted to the OpenClaw plugin lifecycle and tool interface.
+## Examples
+
+| Prompt | Result |
+|---|---|
+| A cute robot cat sitting on a cloud, digital art, vibrant colors | <img src="examples/robot_cat.png" width="300"> |
+| Korean e-commerce poster | <img src="examples/summer_collection.png" width="200"> |
+| Korean tech-book promotional hero banner | <img src="assets/chatgpt-images2-book-hero-rr.png" width="320"> |
 
 ## English first
 
@@ -38,6 +45,10 @@ So the plugin was updated to match the working path.
 
 ## How it works
 
+```text
+User prompt -> JSON payload -> codex responses -> JSONL stream -> base64 decode -> PNG file
+```
+
 ### 1. Binary selection
 
 The plugin prefers this Codex binary first:
@@ -54,7 +65,7 @@ That matters because this machine also had an older binary earlier on `PATH`:
 /usr/local/bin/codex
 ```
 
-The newer binary worked with `codex responses` in this environment; the older one did not.
+The newer binary worked with `codex responses` in this environment, the older one did not.
 
 ### 2. MCP compatibility override
 
@@ -93,7 +104,30 @@ The plugin scans for:
 
 When that event shape is present, it reads the `result` field, decodes the base64 bytes, and writes the PNG file.
 
-### 5. OpenClaw return value
+### 5. 429 round-robin fallback
+
+If ohmyclaw's Codex OAuth pool is available, the plugin can retry on the next OAuth account when one account hits a 429 / `usage_limit_reached` error.
+
+Expected setup:
+
+- `CODEX_OAUTH_ENABLED=true`
+- multiple Codex homes logged in, for example:
+  - `~/.codex`
+  - `~/.codex-acct2`
+  - `~/.codex-acct3`
+- the corresponding Codex pool accounts enabled in:
+  - `~/.openclaw/repos/ohmyclaw/skills/ohmyclaw/routing.json`
+
+Behavior:
+
+1. pick the next Codex OAuth account with `pool.sh next gpt-5.4`
+2. call `codex responses` with that `CODEX_HOME`
+3. if a 429 / `usage_limit_reached` error appears, mark that account in cooldown
+4. retry with the next eligible OAuth account
+
+This makes image generation much more resilient when one ChatGPT/Codex OAuth account is temporarily exhausted.
+
+### 6. OpenClaw return value
 
 The plugin returns:
 
@@ -125,14 +159,14 @@ The plugin returns:
 
 ## Prerequisites
 
-- [OpenAI Codex CLI](https://github.com/openai/codex) installed
-- A Codex version that supports:
+1. [OpenAI Codex CLI](https://github.com/openai/codex) installed
+2. A Codex version that supports:
 
 ```bash
 codex responses
 ```
 
-- Logged in Codex session, ideally verified with:
+3. Logged in Codex session, ideally verified with:
 
 ```bash
 codex login status
@@ -146,36 +180,48 @@ Logged in using ChatGPT
 
 ## Installation
 
-Copy this plugin into your OpenClaw workspace local plugins directory:
-
 ```bash
-cp -r . ~/.openclaw/workspace-<your-bot>/local-plugins/codex-image-gen/
-```
-
-Then restart the gateway:
-
-```bash
+git clone https://github.com/jkf87/openclaw-codex-image-gen.git
+cp -r openclaw-codex-image-gen ~/.openclaw/workspace-<your-bot>/local-plugins/codex-image-gen
 openclaw gateway restart
 ```
 
-## Configuration
+Or download directly:
 
-All config is optional and comes from `openclaw.plugin.json`.
+```bash
+mkdir -p ~/.openclaw/workspace-<your-bot>/local-plugins/codex-image-gen
+cd ~/.openclaw/workspace-<your-bot>/local-plugins/codex-image-gen
+curl -sLO https://raw.githubusercontent.com/jkf87/openclaw-codex-image-gen/main/index.ts
+curl -sLO https://raw.githubusercontent.com/jkf87/openclaw-codex-image-gen/main/openclaw.plugin.json
+curl -sLO https://raw.githubusercontent.com/jkf87/openclaw-codex-image-gen/main/package.json
+```
 
-Implementation note: `model: "gpt-5.4"` and `quality: "high"` are currently hardcoded in `index.ts` and are not user-configurable yet.
+## Usage in OpenClaw
 
-Environment note: if `ohmyclaw`'s Codex OAuth pool is available and enabled, this plugin can rotate across multiple Codex OAuth homes on 429 rate limits.
+Once installed, the plugin registers `codex_image_generate` automatically.
 
-| Key | Type | Default | Description |
-|---|---|---|---|
-| `outputDir` | string | `""` | Default output directory. Uses a temp directory when empty. |
-| `timeoutSeconds` | number | `120` | Max wait time for the Codex subprocess. |
-| `tempDirMaxAgeHours` | number | `24` | Age threshold for deleting stale temp directories. |
-| `cleanupIntervalMinutes` | number | `60` | How often stale temp cleanup is attempted. |
+### Natural language
 
-## Usage
+Just ask naturally. The `pre_llm_call` hook detects image requests in Korean and English.
 
-The plugin registers `codex_image_generate` with these parameters:
+```text
+"고양이 일러스트 그려줘" -> auto-detect -> codex_image_generate -> PNG saved
+```
+
+### Direct tool call
+
+```json
+{
+  "tool": "codex_image_generate",
+  "input": {
+    "prompt": "A futuristic city skyline at sunset, cyberpunk style",
+    "aspect_ratio": "landscape",
+    "background": "opaque"
+  }
+}
+```
+
+### Tool parameters
 
 | Parameter | Required | Description |
 |---|---|---|
@@ -186,18 +232,16 @@ The plugin registers `codex_image_generate` with these parameters:
 | `background` | No | `auto`, `transparent`, or `opaque` |
 | `timeout_seconds` | No | Override subprocess timeout |
 
-Returns:
+Implementation note: `model: "gpt-5.4"` and `quality: "high"` are currently hardcoded in `index.ts` and are not user-configurable yet.
 
-```json
-{
-  "image_path": "...",
-  "file_name": "...",
-  "output_dir": "...",
-  "stdout_log": "...",
-  "stderr_log": "...",
-  "assistant_hint": "..."
-}
-```
+## Configuration
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `outputDir` | string | `""` | Default output directory. Uses a temp directory when empty. |
+| `timeoutSeconds` | number | `120` | Max wait time for the Codex subprocess. |
+| `tempDirMaxAgeHours` | number | `24` | Age threshold for deleting stale temp directories. |
+| `cleanupIntervalMinutes` | number | `60` | How often stale temp cleanup is attempted. |
 
 ## Troubleshooting
 
@@ -224,29 +268,6 @@ codex login status
 
 If the session is not valid, re-login.
 
-### 429 rate limit on one Codex account
-
-This plugin can retry through the ohmyclaw Codex OAuth pool instead of failing immediately.
-
-Expected setup:
-
-- `CODEX_OAUTH_ENABLED=true`
-- multiple Codex homes logged in, for example:
-  - `~/.codex`
-  - `~/.codex-acct2`
-  - `~/.codex-acct3`
-- the corresponding Codex pool accounts enabled in:
-  - `~/.openclaw/repos/ohmyclaw/skills/ohmyclaw/routing.json`
-
-Behavior:
-
-1. pick the next Codex OAuth account with `pool.sh next gpt-5.4`
-2. call `codex responses` with that `CODEX_HOME`
-3. if a 429 / `usage_limit_reached` error appears, mark that account in cooldown
-4. retry with the next eligible OAuth account
-
-This makes image generation much more resilient when one ChatGPT/Codex OAuth account is temporarily exhausted.
-
 ### MCP-related failures appear during generation
 
 This plugin already launches Codex with:
@@ -265,14 +286,18 @@ The expected successful event contains:
 - `response.output_item.done`
 - `item.type = image_generation_call`
 
-## Verified working flow on this machine
+## Korean trigger routing
 
-This repository was tested successfully with:
+The `pre_llm_call` hook auto-detects image generation requests.
+It is hint-based routing, not guaranteed intent classification.
 
-- Codex login active via ChatGPT
-- newer Codex binary at `~/.npm-global/bin/codex`
-- raw `codex responses` image-generation request
-- saved `1024x1024` PNG output
+| Category | Keywords |
+|---|---|
+| Engine | codex, 코덱스, gpt, openai |
+| Nouns | 이미지, 그림, 사진, 아이콘, 일러스트, 배경, 로고, image, picture, icon, illustration |
+| Verbs | 생성, 만들, 그려, 그리, 제작, generate, create, draw, make |
+
+Triggers when: `(engine + noun)` OR `(noun + verb)`.
 
 ## 한국어 안내
 
@@ -289,7 +314,7 @@ This repository was tested successfully with:
 6. base64 이미지를 실제 PNG 파일로 저장함
 7. 저장 경로를 OpenClaw에 반환함
 
-즉, Codex가 코드로 가짜 이미지를 그리는 우회가 아니라, **Codex의 실제 image_generation 경로**를 사용합니다.
+즉, Codex가 코드로 가짜 이미지를 그리는 우회가 아니라, **Codex의 실제 `image_generation` 경로**를 사용합니다.
 
 ### 왜 수정했는가
 
@@ -301,17 +326,6 @@ This repository was tested successfully with:
 - 실제로 안정적으로 성공한 방식은 `codex responses` + `image_generation` 호출이었음
 
 그래서 구현과 문서를 둘 다 그 기준으로 수정했습니다.
-
-### 한국어 사용도 지원함
-
-플러그인에는 `pre_llm_call` 훅이 들어 있어서, 한국어와 영어의 이미지 생성 요청을 둘 다 감지하도록 해두었습니다.
-다만 이건 힌트 기반 라우팅이지, 완전한 의도 분류 보장은 아닙니다.
-예를 들면 다음 같은 표현을 라우팅 대상으로 볼 수 있습니다.
-
-- "코덱스로 이미지 만들어줘"
-- "이미지 생성해줘"
-- "draw an icon"
-- "generate a picture"
 
 ### 429가 뜰 때 Codex OAuth 라운드로빈
 
@@ -334,6 +348,17 @@ This repository was tested successfully with:
 4. 다음 계정으로 자동 재시도
 
 즉, Plus/Pro 계정이 여러 개면 이미지 생성 한도를 한 계정에만 묶지 않고 분산할 수 있습니다.
+
+### 한국어 사용도 지원함
+
+플러그인에는 `pre_llm_call` 훅이 들어 있어서, 한국어와 영어의 이미지 생성 요청을 둘 다 감지하도록 해두었습니다.
+다만 이건 힌트 기반 라우팅이지, 완전한 의도 분류 보장은 아닙니다.
+예를 들면 다음 같은 표현을 라우팅 대상으로 볼 수 있습니다.
+
+- "코덱스로 이미지 만들어줘"
+- "이미지 생성해줘"
+- "draw an icon"
+- "generate a picture"
 
 ## License
 
