@@ -122,10 +122,14 @@ Behavior:
 
 1. pick the next Codex OAuth account with `pool.sh next gpt-5.4`
 2. call `codex responses` with that `CODEX_HOME`
-3. if a 429 / `usage_limit_reached` error appears, mark that account in cooldown
-4. retry with the next eligible OAuth account
+3. if error appears, classify it:
+   - **Rate limit** (429, usage_limit_reached) → mark account as cooldown, retry with next
+   - **Timeout** (timed out, ETIMEDOUT) → mark account as cooldown, retry with next
+   - **Connection error** (ECONNREFUSED, ENOTFOUND) → mark account as cooldown, retry with next
+   - **Other errors** → stop retrying
+4. maximum retry attempts: 5
 
-This makes image generation much more resilient when one ChatGPT/Codex OAuth account is temporarily exhausted.
+This makes image generation much more resilient when one ChatGPT/Codex OAuth account is temporarily exhausted, encounters network issues, or hits timeouts.
 
 ### 6. OpenClaw return value
 
@@ -155,7 +159,13 @@ The plugin returns:
 - **Codex availability caching** for 5 minutes
 - **Temp directory cleanup** for stale output folders
 - **Saved event logs** for debugging extraction failures
-- **429 round-robin fallback** through the ohmyclaw Codex OAuth pool when multiple accounts are enabled
+- **Multi-account retry with enhanced error handling**:
+  - Rate limit detection (429, usage_limit_reached)
+  - Timeout detection (timed out, ETIMEDOUT)
+  - Connection error detection (ECONNREFUSED, ENOTFOUND)
+  - Automatic account cooldown on failures
+  - Up to 5 retry attempts
+  - Detailed attempt logging for debugging
 
 ## Prerequisites
 
@@ -344,10 +354,22 @@ Triggers when: `(engine + noun)` OR `(noun + verb)`.
 
 1. `pool.sh next gpt-5.4` 로 다음 계정을 고름
 2. 그 계정의 `CODEX_HOME` 으로 `codex responses` 호출
-3. 429 또는 `usage_limit_reached` 가 뜨면 해당 계정을 cooldown 처리
-4. 다음 계정으로 자동 재시도
+3. 에러가 발생하면 분류:
+   - **레이트 리밋** (429, usage_limit_reached) → 계정을 cooldown 처리 후 다음 계정으로
+   - **타임아웃** (timed out, ETIMEDOUT) → 계정을 cooldown 처리 후 다음 계정으로
+   - **커넥션 에러** (ECONNREFUSED, ENOTFOUND) → 계정을 cooldown 처리 후 다음 계정으로
+   - **기타 에러** → 재시도 중지
+4. 최대 5회까지 재시도
 
 즉, Plus/Pro 계정이 여러 개면 이미지 생성 한도를 한 계정에만 묶지 않고 분산할 수 있습니다.
+
+**v1.1.0 개선사항:**
+
+- **타임아웃 에러 처리**: 요청 시간 초과 발생 시 다음 계정으로 자동 전환
+- **커넥션 에러 처리**: 네트워크 연결 실패 시 다음 계정으로 자동 전환
+- **최대 시도 횟수 증가**: 4회에서 5회로 증가
+- **상세한 로깅**: 각 시도마다 계정 ID, 경과 시간, 에러 유형을 기록
+- **에러 로그 파일 개선**: 실패 시 `error.log`에 상세한 실패 정보 저장
 
 ### 한국어 사용도 지원함
 
@@ -359,6 +381,39 @@ Triggers when: `(engine + noun)` OR `(noun + verb)`.
 - "이미지 생성해줘"
 - "draw an icon"
 - "generate a picture"
+
+## Changelog
+
+### v1.1.0 (2026-05-02)
+
+**Enhancements:**
+- **Timeout error handling**: Added `isTimeoutError()` function to detect timeout errors (timed out, timeout, ETIMEDOUT)
+- **Connection error handling**: Added `isConnectionError()` function to detect network errors (ECONNREFUSED, ENOTFOUND)
+- **Enhanced retry logic**: Multi-account routing now retries on timeout and connection errors, not just rate limits
+- **Increased retry attempts**: Maximum retry attempts increased from 4 to 5
+- **Detailed logging**: Added comprehensive attempt logging with:
+  - Account ID used
+  - Elapsed time per attempt
+  - Error classification (rate_limit/timeout/connection)
+  - Success/failure status
+  - Complete error log file in temp directory
+
+**Bug fixes:**
+- Fixed stuck accounts when timeout occurred - now properly marks account as cooldown
+- Improved error classification to prevent retry loops on permanent failures
+
+**Documentation:**
+- Updated README with enhanced error handling section
+- Added changelog section
+
+**Testing:**
+- Added `test/error-detection.test.js` for error detection functions
+- Added `test/multi-account.test.js` for multi-account routing logic
+- All tests run with `npm test` (Node.js native test runner)
+
+### v1.0.1
+
+Initial release with Codex `image_generation` tool support and 429 round-robin fallback.
 
 ## License
 

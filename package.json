@@ -1,12 +1,22 @@
 {
   "name": "codex-image-gen",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "private": true,
   "description": "OpenClaw plugin for Codex CLI image generation via codex responses and image_generation.",
   "main": "index.ts",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "build": "tsc",
+    "dev": "tsx index.ts"
+  },
   "openclaw": {
     "extensions": [
       "./index.ts"
     ]
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0",
+    "tsx": "^4.0.0"
   }
 }

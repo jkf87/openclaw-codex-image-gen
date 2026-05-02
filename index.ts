@@ -104,6 +104,16 @@ function isRateLimitError(message: string) {
   return text.includes("429") || text.includes("usage_limit_reached") || text.includes("too many requests");
 }
 
+function isTimeoutError(message: string) {
+  const text = message.toLowerCase();
+  return text.includes("timed out") || text.includes("timeout") || text.includes("etimedout");
+}
+
+function isConnectionError(message: string) {
+  const text = message.toLowerCase();
+  return text.includes("econnrefused") || text.includes("enotfound") || text.includes("connection refused");
+}
+
 type PoolAccount = {
   id: string;
   authType: string;
@@ -251,8 +261,9 @@ async function generate(params: ImageGenParams, cfg: Required<Cfg>) {
   let lastErr: any = null;
   let usedAccountId = "";
   const tried = new Set<string>();
-  const maxAttempts = 4;
+  const maxAttempts = 5;
   const stderrParts: string[] = [];
+  const attemptLog: string[] = [];
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const account = await pickCodexPoolAccount("gpt-5.4");
@@ -261,32 +272,88 @@ async function generate(params: ImageGenParams, cfg: Required<Cfg>) {
     if (account && tried.has(account.id)) break;
     if (account) tried.add(account.id);
 
+    const attemptStart = Date.now();
+    api.logger.info(`codex_image_generate attempt ${attempt + 1}/${maxAttempts}`, {
+      accountId,
+      hasAccount: !!account,
+      model: "gpt-5.4",
+    });
+
     try {
       const result = await runCodexResponses(codexPath, payload, outDir, timeout, codexHome);
+      const elapsed = Date.now() - attemptStart;
       stdout = result.stdout;
       stderr = result.stderr;
       usedAccountId = accountId;
+      attemptLog.push(`[attempt ${attempt + 1}] SUCCESS account=${accountId} elapsed=${elapsed}ms`);
+      api.logger.info(`codex_image_generate attempt ${attempt + 1} succeeded`, {
+        accountId,
+        elapsed,
+        stdoutLength: stdout.length,
+        stderrLength: stderr.length,
+      });
       if (account) await releaseCodexPoolAccount(account.id);
       lastErr = null;
       break;
     } catch (err: any) {
+      const elapsed = Date.now() - attemptStart;
       lastErr = err;
       const errText = err?.stderr || err?.message || String(err);
+      const isRL = isRateLimitError(errText);
+      const isTO = isTimeoutError(errText);
+      const isConn = isConnectionError(errText);
+      
+      attemptLog.push(
+        `[attempt ${attempt + 1}] FAILED account=${accountId} elapsed=${elapsed}ms ` +
+        `rateLimit=${isRL} timeout=${isTO} connection=${isConn} ` +
+        `error=${errText.slice(0, 200)}`
+      );
+      
+      api.logger.warn(`codex_image_generate attempt ${attempt + 1} failed`, {
+        accountId,
+        elapsed,
+        isRateLimit: isRL,
+        isTimeout: isTO,
+        isConnection: isConn,
+        error: errText.slice(0, 500),
+      });
+
       stderrParts.push(`[attempt ${attempt + 1}][${accountId}] ${errText}`);
-      if (account && isRateLimitError(errText)) {
-        await markCodexPoolCooldown(account.id);
-        continue;
-      }
-      if (!account && isRateLimitError(errText)) {
-        continue;
+      
+      if (account) {
+        if (isRL || isTO || isConn) {
+          await markCodexPoolCooldown(account.id);
+          api.logger.info(`codex_image_gen: Marked account ${account.id} as cooldown`, {
+            reason: isRL ? "rate_limit" : isTO ? "timeout" : "connection",
+          });
+          continue;
+        }
+      } else {
+        if (isRL || isTO) {
+          continue;
+        }
       }
       break;
     }
   }
 
-  if (lastErr) throw lastErr;
+  if (lastErr) {
+    const finalLog = [
+      "=== CODEX IMAGE GENERATION FAILED ===",
+      `attempts: ${attempt}/${maxAttempts}`,
+      ...attemptLog,
+      "=== ERROR DETAILS ===",
+      lastErr?.message || String(lastErr),
+      lastErr?.stderr || "",
+    ].join("\n");
+    await writeFile(join(outDir, "error.log"), finalLog).catch(() => {});
+    throw new Error(`Codex image generation failed after ${attempt} attempts. Check logs in: ${outDir}`);
+  }
 
-  await Promise.all([writeFile(eventsPath, stdout).catch(() => {}), writeFile(stderrLog, [...stderrParts, stderr, usedAccountId ? `used_account=${usedAccountId}` : ""].filter(Boolean).join("\n\n")).catch(() => {})]);
+  await Promise.all([
+    writeFile(eventsPath, stdout).catch(() => {}),
+    writeFile(stderrLog, [...attemptLog, "", ...stderrParts, stderr, usedAccountId ? `used_account=${usedAccountId}` : ""].filter(Boolean).join("\n")).catch(() => {}),
+  ]);
 
   const imageBase64 = extractImageBase64(stdout);
   if (!imageBase64) throw new Error("Codex produced no image_generation_call result. Check logs in: " + outDir);
